@@ -73,7 +73,7 @@ export type SubjectMetadataControllerMessenger = RestrictedControllerMessenger<
 type SubjectMetadataControllerOptions = {
   hasPermissions: PermissionController['hasPermissions'];
   messenger: SubjectMetadataControllerMessenger;
-  metadataCacheSize: number;
+  subjectCacheLimit: number;
   state?: Partial<SubjectMetadataControllerState>;
 };
 
@@ -81,20 +81,20 @@ export class SubjectMetadataController extends BaseController<
   typeof controllerName,
   SubjectMetadataControllerState
 > {
-  private _metadataCacheSize: number;
+  private _subjectCacheLimit: number;
 
-  get metadataCacheSize(): number {
-    return this._metadataCacheSize;
+  get subjectCacheLimit(): number {
+    return this._subjectCacheLimit;
   }
 
-  private pendingMetadataCache: Set<string>;
+  private subjectsEncounteredSinceStartup: Set<string>;
 
   private subjectHasPermissions: PermissionController['hasPermissions'];
 
   constructor({
     hasPermissions,
     messenger,
-    metadataCacheSize,
+    subjectCacheLimit,
     state = {},
   }: SubjectMetadataControllerOptions) {
     if (state.subjectMetadata) {
@@ -112,8 +112,8 @@ export class SubjectMetadataController extends BaseController<
     });
 
     this.subjectHasPermissions = hasPermissions;
-    this._metadataCacheSize = metadataCacheSize;
-    this.pendingMetadataCache = new Set();
+    this._subjectCacheLimit = subjectCacheLimit;
+    this.subjectsEncounteredSinceStartup = new Set();
     this.registerMessageHandlers();
   }
 
@@ -135,30 +135,50 @@ export class SubjectMetadataController extends BaseController<
     });
   }
 
+  /**
+   * Stores domain metadata for the given origin (subject). Deletes metadata for
+   * subjects without permissions in a FIFO manner, once more than
+   * {@link SubjectMetadataController.subjectCacheLimit} distinct origins have
+   * been added since boot.
+   *
+   * Metadata is never deleted for subjects with permissions, to prevent a
+   * degraded user experience, since metadata cannot yet be requested on demand.
+   *
+   * @param subjectOrigin - The origin of the subject whose metadata to store.
+   * @param metadata - The subject metadata to store.
+   */
   addSubjectMetadata(
     subjectOrigin: SubjectOrigin,
     metadata: SubjectMetadata,
   ): void {
-    const subjectsToTrim: SubjectOrigin[] = [];
+    const newMetadata = { ...metadata };
+    let originToForget: string | null = null;
 
-    if (this.pendingMetadataCache.size >= this._metadataCacheSize) {
-      this.pendingMetadataCache.forEach((cachedOrigin) => {
-        if (!this.subjectHasPermissions(cachedOrigin)) {
-          subjectsToTrim.push(cachedOrigin);
-        }
+    // We only delete the oldest encountered subject from the cache, again to
+    // ensure that the user's experience isn't degraded by missing icons etc.
+    if (this.subjectsEncounteredSinceStartup.size >= this.subjectCacheLimit) {
+      const cachedOrigin = this.subjectsEncounteredSinceStartup
+        .values()
+        .next().value;
 
-        this.pendingMetadataCache.delete(cachedOrigin);
-      });
+      this.subjectsEncounteredSinceStartup.delete(cachedOrigin);
+      if (this.subjectHasPermissions(cachedOrigin)) {
+        originToForget = cachedOrigin;
+      }
     }
 
-    this.pendingMetadataCache.add(subjectOrigin);
+    this.subjectsEncounteredSinceStartup.add(subjectOrigin);
+
+    if (!newMetadata.extensionId && !newMetadata.host) {
+      newMetadata.host = new URL(origin).host;
+    }
+
     this.update((draftState) => {
       // Typecasts: ts(2589)
-      draftState.subjectMetadata[subjectOrigin] = metadata as any;
-      SubjectMetadataController.trimMetadataState(
-        draftState as any,
-        subjectsToTrim,
-      );
+      draftState.subjectMetadata[subjectOrigin] = newMetadata as any;
+      if (typeof originToForget === 'string') {
+        delete draftState.subjectMetadata[originToForget];
+      }
     });
   }
 
@@ -173,22 +193,14 @@ export class SubjectMetadataController extends BaseController<
 
   private static trimMetadataState(
     draftState: SubjectMetadataControllerState,
-    subjectsToTrimOrHasPermissions:
-      | SubjectMetadataController['subjectHasPermissions']
-      | SubjectOrigin[],
+    hasPermissions: SubjectMetadataController['subjectHasPermissions'],
   ): void {
     const { subjectMetadata } = draftState;
 
-    if (typeof subjectsToTrimOrHasPermissions === 'function') {
-      Object.keys(subjectMetadata).forEach((origin) => {
-        if (!subjectsToTrimOrHasPermissions(origin)) {
-          delete subjectMetadata[origin];
-        }
-      });
-    } else {
-      subjectsToTrimOrHasPermissions.forEach(
-        (origin) => delete subjectMetadata[origin],
-      );
-    }
+    Object.keys(subjectMetadata).forEach((origin) => {
+      if (!hasPermissions(origin)) {
+        delete subjectMetadata[origin];
+      }
+    });
   }
 }
